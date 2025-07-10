@@ -15,6 +15,13 @@
 (define-constant ERR_DEADLINE_NOT_PASSED (err u108))
 (define-constant ERR_ALREADY_AGREED (err u109))
 (define-constant ERR_INVALID_AMOUNT (err u110))
+(define-constant ERR_MILESTONE_NOT_FOUND (err u111))
+(define-constant ERR_MILESTONE_ALREADY_COMPLETED (err u112))
+(define-constant ERR_MILESTONE_ALREADY_EXISTS (err u113))
+(define-constant ERR_INVALID_MILESTONE_INDEX (err u114))
+(define-constant ERR_PREVIOUS_MILESTONE_NOT_COMPLETE (err u115))
+(define-constant ERR_MILESTONE_PERCENTAGE_INVALID (err u116))
+(define-constant ERR_TOTAL_PERCENTAGE_INVALID (err u117))
 
 (define-data-var settlement-counter uint u0)
 
@@ -43,6 +50,28 @@
 (define-map user-settlements
   { user: principal }
   { settlement-ids: (list 100 uint) }
+)
+
+(define-map settlement-milestones
+  { settlement-id: uint, milestone-index: uint }
+  {
+    description: (string-ascii 200),
+    percentage: uint,
+    completed: bool,
+    completed-at: (optional uint),
+    completed-by: (optional principal),
+    evidence-hash: (optional (string-ascii 64))
+  }
+)
+
+(define-map milestone-metadata
+  { settlement-id: uint }
+  {
+    total-milestones: uint,
+    completed-milestones: uint,
+    total-percentage: uint,
+    released-amount: uint
+  }
 )
 
 (define-public (create-settlement (defendant principal) (arbitrator principal) (amount uint) (deadline uint))
@@ -268,5 +297,236 @@
   (match (map-get? settlements { settlement-id: settlement-id })
     settlement (get status settlement)
     "not-found"
+  )
+)
+
+(define-public (create-milestone (settlement-id uint) (description (string-ascii 200)) (percentage uint))
+  (let
+    (
+      (settlement (unwrap! (map-get? settlements { settlement-id: settlement-id }) ERR_SETTLEMENT_NOT_FOUND))
+      (metadata (default-to 
+        { total-milestones: u0, completed-milestones: u0, total-percentage: u0, released-amount: u0 }
+        (map-get? milestone-metadata { settlement-id: settlement-id })))
+      (milestone-index (+ (get total-milestones metadata) u1))
+      (new-total-percentage (+ (get total-percentage metadata) percentage))
+    )
+    (asserts! (or (is-eq tx-sender (get plaintiff settlement)) (is-eq tx-sender (get defendant settlement))) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status settlement) "pending") ERR_SETTLEMENT_NOT_ACTIVE)
+    (asserts! (> percentage u0) ERR_MILESTONE_PERCENTAGE_INVALID)
+    (asserts! (<= percentage u100) ERR_MILESTONE_PERCENTAGE_INVALID)
+    (asserts! (<= new-total-percentage u100) ERR_TOTAL_PERCENTAGE_INVALID)
+    (asserts! (is-none (map-get? settlement-milestones { settlement-id: settlement-id, milestone-index: milestone-index })) ERR_MILESTONE_ALREADY_EXISTS)
+    
+    (map-set settlement-milestones
+      { settlement-id: settlement-id, milestone-index: milestone-index }
+      {
+        description: description,
+        percentage: percentage,
+        completed: false,
+        completed-at: none,
+        completed-by: none,
+        evidence-hash: none
+      }
+    )
+    
+    (map-set milestone-metadata
+      { settlement-id: settlement-id }
+      (merge metadata {
+        total-milestones: milestone-index,
+        total-percentage: new-total-percentage
+      })
+    )
+    
+    (ok milestone-index)
+  )
+)
+
+(define-public (complete-milestone (settlement-id uint) (milestone-index uint) (evidence-hash (optional (string-ascii 64))))
+  (let
+    (
+      (settlement (unwrap! (map-get? settlements { settlement-id: settlement-id }) ERR_SETTLEMENT_NOT_FOUND))
+      (milestone (unwrap! (map-get? settlement-milestones { settlement-id: settlement-id, milestone-index: milestone-index }) ERR_MILESTONE_NOT_FOUND))
+      (metadata (unwrap! (map-get? milestone-metadata { settlement-id: settlement-id }) ERR_MILESTONE_NOT_FOUND))
+      (current-block stacks-block-height)
+      (funds (unwrap! (map-get? settlement-funds { settlement-id: settlement-id }) ERR_INSUFFICIENT_FUNDS))
+    )
+    (asserts! (is-eq (get status settlement) "funded") ERR_SETTLEMENT_NOT_ACTIVE)
+    (asserts! (not (get completed milestone)) ERR_MILESTONE_ALREADY_COMPLETED)
+    (asserts! (or (is-eq tx-sender (get plaintiff settlement)) (is-eq tx-sender (get defendant settlement)) (is-eq tx-sender (get arbitrator settlement))) ERR_UNAUTHORIZED)
+    (asserts! (or (is-eq milestone-index u1) (is-milestone-previous-completed settlement-id (- milestone-index u1))) ERR_PREVIOUS_MILESTONE_NOT_COMPLETE)
+    
+    (let
+      (
+        (payment-amount (/ (* (get deposited-amount funds) (get percentage milestone)) u100))
+        (recipient (get defendant settlement))
+        (new-completed-milestones (+ (get completed-milestones metadata) u1))
+        (new-released-amount (+ (get released-amount metadata) payment-amount))
+      )
+      (try! (as-contract (stx-transfer? payment-amount tx-sender recipient)))
+      
+      (map-set settlement-milestones
+        { settlement-id: settlement-id, milestone-index: milestone-index }
+        (merge milestone {
+          completed: true,
+          completed-at: (some current-block),
+          completed-by: (some tx-sender),
+          evidence-hash: evidence-hash
+        })
+      )
+      
+      (map-set milestone-metadata
+        { settlement-id: settlement-id }
+        (merge metadata {
+          completed-milestones: new-completed-milestones,
+          released-amount: new-released-amount
+        })
+      )
+      
+      (map-set settlement-funds
+        { settlement-id: settlement-id }
+        { deposited-amount: (- (get deposited-amount funds) payment-amount) }
+      )
+      
+      (if (is-eq new-completed-milestones (get total-milestones metadata))
+        (begin
+          (map-set settlements
+            { settlement-id: settlement-id }
+            (merge settlement {
+              status: "resolved",
+              resolved-at: (some current-block)
+            })
+          )
+          (ok "settlement-fully-resolved")
+        )
+        (ok "milestone-completed")
+      )
+    )
+  )
+)
+
+(define-public (dispute-milestone (settlement-id uint) (milestone-index uint) (reason (string-ascii 200)))
+  (let
+    (
+      (settlement (unwrap! (map-get? settlements { settlement-id: settlement-id }) ERR_SETTLEMENT_NOT_FOUND))
+      (milestone (unwrap! (map-get? settlement-milestones { settlement-id: settlement-id, milestone-index: milestone-index }) ERR_MILESTONE_NOT_FOUND))
+    )
+    (asserts! (is-eq (get status settlement) "funded") ERR_SETTLEMENT_NOT_ACTIVE)
+    (asserts! (not (get completed milestone)) ERR_MILESTONE_ALREADY_COMPLETED)
+    (asserts! (or (is-eq tx-sender (get plaintiff settlement)) (is-eq tx-sender (get defendant settlement))) ERR_UNAUTHORIZED)
+    
+    (map-set settlements
+      { settlement-id: settlement-id }
+      (merge settlement { status: "disputed" })
+    )
+    
+    (ok reason)
+  )
+)
+
+(define-public (arbitrator-resolve-milestone (settlement-id uint) (milestone-index uint) (approved bool) (evidence-hash (optional (string-ascii 64))))
+  (let
+    (
+      (settlement (unwrap! (map-get? settlements { settlement-id: settlement-id }) ERR_SETTLEMENT_NOT_FOUND))
+      (milestone (unwrap! (map-get? settlement-milestones { settlement-id: settlement-id, milestone-index: milestone-index }) ERR_MILESTONE_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get arbitrator settlement)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status settlement) "disputed") ERR_SETTLEMENT_NOT_ACTIVE)
+    (asserts! (not (get completed milestone)) ERR_MILESTONE_ALREADY_COMPLETED)
+    
+    (map-set settlements
+      { settlement-id: settlement-id }
+      (merge settlement { status: "funded" })
+    )
+    
+    (if approved
+      (complete-milestone settlement-id milestone-index evidence-hash)
+      (ok "milestone-rejected")
+    )
+  )
+)
+
+(define-public (withdraw-remaining-funds (settlement-id uint))
+  (let
+    (
+      (settlement (unwrap! (map-get? settlements { settlement-id: settlement-id }) ERR_SETTLEMENT_NOT_FOUND))
+      (metadata (unwrap! (map-get? milestone-metadata { settlement-id: settlement-id }) ERR_MILESTONE_NOT_FOUND))
+      (funds (unwrap! (map-get? settlement-funds { settlement-id: settlement-id }) ERR_INSUFFICIENT_FUNDS))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq (get status settlement) "resolved") ERR_SETTLEMENT_NOT_ACTIVE)
+    (asserts! (> (get deposited-amount funds) u0) ERR_INSUFFICIENT_FUNDS)
+    (asserts! (or (is-eq tx-sender (get plaintiff settlement)) (is-eq tx-sender (get defendant settlement))) ERR_UNAUTHORIZED)
+    
+    (let
+      (
+        (remaining-amount (get deposited-amount funds))
+        (recipient (get plaintiff settlement))
+      )
+      (try! (as-contract (stx-transfer? remaining-amount tx-sender recipient)))
+      
+      (map-set settlement-funds
+        { settlement-id: settlement-id }
+        { deposited-amount: u0 }
+      )
+      
+      (ok remaining-amount)
+    )
+  )
+)
+
+(define-read-only (get-milestone (settlement-id uint) (milestone-index uint))
+  (map-get? settlement-milestones { settlement-id: settlement-id, milestone-index: milestone-index })
+)
+
+(define-read-only (get-milestone-metadata (settlement-id uint))
+  (map-get? milestone-metadata { settlement-id: settlement-id })
+)
+
+(define-read-only (get-milestone-progress (settlement-id uint))
+  (match (map-get? milestone-metadata { settlement-id: settlement-id })
+    metadata (if (> (get total-milestones metadata) u0)
+      (/ (* (get completed-milestones metadata) u100) (get total-milestones metadata))
+      u0
+    )
+    u0
+  )
+)
+
+(define-read-only (is-milestone-previous-completed (settlement-id uint) (milestone-index uint))
+  (if (is-eq milestone-index u0)
+    true
+    (match (map-get? settlement-milestones { settlement-id: settlement-id, milestone-index: milestone-index })
+      milestone (get completed milestone)
+      false
+    )
+  )
+)
+
+(define-read-only (calculate-milestone-payout (settlement-id uint) (milestone-index uint))
+  (match (map-get? settlement-milestones { settlement-id: settlement-id, milestone-index: milestone-index })
+    milestone (match (map-get? settlement-funds { settlement-id: settlement-id })
+      funds (/ (* (get deposited-amount funds) (get percentage milestone)) u100)
+      u0
+    )
+    u0
+  )
+)
+
+(define-read-only (get-settlement-milestones-summary (settlement-id uint))
+  (match (map-get? milestone-metadata { settlement-id: settlement-id })
+    metadata {
+      total-milestones: (get total-milestones metadata),
+      completed-milestones: (get completed-milestones metadata),
+      progress-percentage: (get-milestone-progress settlement-id),
+      total-percentage: (get total-percentage metadata),
+      released-amount: (get released-amount metadata)
+    }
+    {
+      total-milestones: u0,
+      completed-milestones: u0,
+      progress-percentage: u0,
+      total-percentage: u0,
+      released-amount: u0
+    }
   )
 )
