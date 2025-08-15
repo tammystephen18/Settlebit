@@ -22,6 +22,13 @@
 (define-constant ERR_PREVIOUS_MILESTONE_NOT_COMPLETE (err u115))
 (define-constant ERR_MILESTONE_PERCENTAGE_INVALID (err u116))
 (define-constant ERR_TOTAL_PERCENTAGE_INVALID (err u117))
+(define-constant ERR_PARTY_NOT_FOUND (err u118))
+(define-constant ERR_PARTY_ALREADY_EXISTS (err u119))
+(define-constant ERR_INVALID_WEIGHT (err u120))
+(define-constant ERR_INSUFFICIENT_APPROVAL_WEIGHT (err u121))
+(define-constant ERR_INVALID_DISTRIBUTION_PERCENTAGE (err u122))
+(define-constant ERR_MULTIPARTY_NOT_ENABLED (err u123))
+(define-constant ERR_PARTY_LIMIT_EXCEEDED (err u124))
 
 (define-data-var settlement-counter uint u0)
 
@@ -72,6 +79,35 @@
     total-percentage: uint,
     released-amount: uint
   }
+)
+
+;; Multi-party settlement support
+(define-map multiparty-settlements
+  { settlement-id: uint }
+  {
+    enabled: bool,
+    total-parties: uint,
+    total-weight: uint,
+    approval-threshold: uint,
+    current-approval-weight: uint,
+    distribution-finalized: bool
+  }
+)
+
+(define-map settlement-parties
+  { settlement-id: uint, party: principal }
+  {
+    role: (string-ascii 20), ;; "plaintiff", "defendant", "stakeholder"
+    weight: uint,
+    distribution-percentage: uint,
+    has-approved: bool,
+    approved-at: (optional uint)
+  }
+)
+
+(define-map party-lists
+  { settlement-id: uint }
+  { parties: (list 50 principal) }
 )
 
 (define-public (create-settlement (defendant principal) (arbitrator principal) (amount uint) (deadline uint))
@@ -530,3 +566,265 @@
     }
   )
 )
+
+;; Enable multi-party support for a settlement
+(define-public (enable-multiparty-settlement (settlement-id uint) (approval-threshold uint))
+  (let
+    (
+      (settlement (unwrap! (map-get? settlements { settlement-id: settlement-id }) ERR_SETTLEMENT_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get plaintiff settlement)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status settlement) "pending") ERR_SETTLEMENT_NOT_ACTIVE)
+    (asserts! (> approval-threshold u0) ERR_INVALID_WEIGHT)
+    (asserts! (<= approval-threshold u100) ERR_INVALID_WEIGHT)
+    
+    (map-set multiparty-settlements
+      { settlement-id: settlement-id }
+      {
+        enabled: true,
+        total-parties: u0,
+        total-weight: u0,
+        approval-threshold: approval-threshold,
+        current-approval-weight: u0,
+        distribution-finalized: false
+      }
+    )
+    
+    (ok settlement-id)
+  )
+)
+
+;; Add a party to multi-party settlement
+(define-public (add-settlement-party (settlement-id uint) (party principal) (role (string-ascii 20)) (weight uint) (distribution-percentage uint))
+  (let
+    (
+      (settlement (unwrap! (map-get? settlements { settlement-id: settlement-id }) ERR_SETTLEMENT_NOT_FOUND))
+      (multiparty (unwrap! (map-get? multiparty-settlements { settlement-id: settlement-id }) ERR_MULTIPARTY_NOT_ENABLED))
+      (party-list (default-to { parties: (list) } (map-get? party-lists { settlement-id: settlement-id })))
+    )
+    (asserts! (get enabled multiparty) ERR_MULTIPARTY_NOT_ENABLED)
+    (asserts! (is-eq tx-sender (get plaintiff settlement)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status settlement) "pending") ERR_SETTLEMENT_NOT_ACTIVE)
+    (asserts! (> weight u0) ERR_INVALID_WEIGHT)
+    (asserts! (<= distribution-percentage u100) ERR_INVALID_DISTRIBUTION_PERCENTAGE)
+    (asserts! (< (get total-parties multiparty) u50) ERR_PARTY_LIMIT_EXCEEDED)
+    (asserts! (is-none (map-get? settlement-parties { settlement-id: settlement-id, party: party })) ERR_PARTY_ALREADY_EXISTS)
+    
+    (let
+      (
+        (new-total-parties (+ (get total-parties multiparty) u1))
+        (new-total-weight (+ (get total-weight multiparty) weight))
+        (updated-parties (unwrap! (as-max-len? (append (get parties party-list) party) u50) ERR_PARTY_LIMIT_EXCEEDED))
+      )
+      
+      (map-set settlement-parties
+        { settlement-id: settlement-id, party: party }
+        {
+          role: role,
+          weight: weight,
+          distribution-percentage: distribution-percentage,
+          has-approved: false,
+          approved-at: none
+        }
+      )
+      
+      (map-set multiparty-settlements
+        { settlement-id: settlement-id }
+        (merge multiparty {
+          total-parties: new-total-parties,
+          total-weight: new-total-weight
+        })
+      )
+      
+      (map-set party-lists
+        { settlement-id: settlement-id }
+        { parties: updated-parties }
+      )
+      
+      (ok party)
+    )
+  )
+)
+
+;; Multi-party approval system
+(define-public (multiparty-approve (settlement-id uint))
+  (let
+    (
+      (settlement (unwrap! (map-get? settlements { settlement-id: settlement-id }) ERR_SETTLEMENT_NOT_FOUND))
+      (multiparty (unwrap! (map-get? multiparty-settlements { settlement-id: settlement-id }) ERR_MULTIPARTY_NOT_ENABLED))
+      (party-info (unwrap! (map-get? settlement-parties { settlement-id: settlement-id, party: tx-sender }) ERR_PARTY_NOT_FOUND))
+      (current-block stacks-block-height)
+    )
+    (asserts! (get enabled multiparty) ERR_MULTIPARTY_NOT_ENABLED)
+    (asserts! (is-eq (get status settlement) "funded") ERR_SETTLEMENT_NOT_ACTIVE)
+    (asserts! (not (get has-approved party-info)) ERR_ALREADY_AGREED)
+    
+    (let
+      (
+        (new-approval-weight (+ (get current-approval-weight multiparty) (get weight party-info)))
+        (threshold-met (>= new-approval-weight (get approval-threshold multiparty)))
+      )
+      
+      (map-set settlement-parties
+        { settlement-id: settlement-id, party: tx-sender }
+        (merge party-info {
+          has-approved: true,
+          approved-at: (some current-block)
+        })
+      )
+      
+      (map-set multiparty-settlements
+        { settlement-id: settlement-id }
+        (merge multiparty { current-approval-weight: new-approval-weight })
+      )
+      
+      (if threshold-met
+        (begin
+          (try! (finalize-multiparty-distribution settlement-id))
+          (ok "settlement-approved")
+        )
+        (ok "vote-recorded")
+      )
+    )
+  )
+)
+
+;; Finalize multi-party distribution
+(define-private (finalize-multiparty-distribution (settlement-id uint))
+  (let
+    (
+      (settlement (unwrap! (map-get? settlements { settlement-id: settlement-id }) ERR_SETTLEMENT_NOT_FOUND))
+      (multiparty (unwrap! (map-get? multiparty-settlements { settlement-id: settlement-id }) ERR_MULTIPARTY_NOT_ENABLED))
+      (funds (unwrap! (map-get? settlement-funds { settlement-id: settlement-id }) ERR_INSUFFICIENT_FUNDS))
+      (current-block stacks-block-height)
+    )
+    
+    (map-set settlements
+      { settlement-id: settlement-id }
+      (merge settlement {
+        status: "resolved",
+        resolved-at: (some current-block)
+      })
+    )
+    
+    (map-set multiparty-settlements
+      { settlement-id: settlement-id }
+      (merge multiparty { distribution-finalized: true })
+    )
+    
+    (ok settlement-id)
+  )
+)
+
+;; Claim funds for multi-party settlement
+(define-public (claim-multiparty-funds (settlement-id uint))
+  (let
+    (
+      (settlement (unwrap! (map-get? settlements { settlement-id: settlement-id }) ERR_SETTLEMENT_NOT_FOUND))
+      (multiparty (unwrap! (map-get? multiparty-settlements { settlement-id: settlement-id }) ERR_MULTIPARTY_NOT_ENABLED))
+      (party-info (unwrap! (map-get? settlement-parties { settlement-id: settlement-id, party: tx-sender }) ERR_PARTY_NOT_FOUND))
+      (funds (unwrap! (map-get? settlement-funds { settlement-id: settlement-id }) ERR_INSUFFICIENT_FUNDS))
+    )
+    (asserts! (get enabled multiparty) ERR_MULTIPARTY_NOT_ENABLED)
+    (asserts! (is-eq (get status settlement) "resolved") ERR_SETTLEMENT_NOT_ACTIVE)
+    (asserts! (get distribution-finalized multiparty) ERR_SETTLEMENT_NOT_ACTIVE)
+    (asserts! (get has-approved party-info) ERR_UNAUTHORIZED)
+    
+    (let
+      (
+        (claim-amount (/ (* (get deposited-amount funds) (get distribution-percentage party-info)) u100))
+      )
+      (asserts! (> claim-amount u0) ERR_INSUFFICIENT_FUNDS)
+      
+      (try! (as-contract (stx-transfer? claim-amount tx-sender tx-sender)))
+      
+      (map-set settlement-parties
+        { settlement-id: settlement-id, party: tx-sender }
+        (merge party-info { distribution-percentage: u0 })
+      )
+      
+      (ok claim-amount)
+    )
+  )
+)
+
+;; Remove party from settlement (before funding)
+(define-public (remove-settlement-party (settlement-id uint) (party principal))
+  (let
+    (
+      (settlement (unwrap! (map-get? settlements { settlement-id: settlement-id }) ERR_SETTLEMENT_NOT_FOUND))
+      (multiparty (unwrap! (map-get? multiparty-settlements { settlement-id: settlement-id }) ERR_MULTIPARTY_NOT_ENABLED))
+      (party-info (unwrap! (map-get? settlement-parties { settlement-id: settlement-id, party: party }) ERR_PARTY_NOT_FOUND))
+    )
+    (asserts! (get enabled multiparty) ERR_MULTIPARTY_NOT_ENABLED)
+    (asserts! (is-eq tx-sender (get plaintiff settlement)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status settlement) "pending") ERR_SETTLEMENT_NOT_ACTIVE)
+    
+    (let
+      (
+        (new-total-parties (- (get total-parties multiparty) u1))
+        (new-total-weight (- (get total-weight multiparty) (get weight party-info)))
+      )
+      
+      (map-delete settlement-parties { settlement-id: settlement-id, party: party })
+      
+      (map-set multiparty-settlements
+        { settlement-id: settlement-id }
+        (merge multiparty {
+          total-parties: new-total-parties,
+          total-weight: new-total-weight
+        })
+      )
+      
+      (ok party)
+    )
+  )
+)
+
+;; Helper function for filtering parties (simplified approach)
+(define-private (is-not-target-party (party-to-check principal))
+  true
+)
+
+;; Read-only functions for multi-party settlements
+(define-read-only (get-multiparty-settlement (settlement-id uint))
+  (map-get? multiparty-settlements { settlement-id: settlement-id })
+)
+
+(define-read-only (get-settlement-party (settlement-id uint) (party principal))
+  (map-get? settlement-parties { settlement-id: settlement-id, party: party })
+)
+
+(define-read-only (get-settlement-parties (settlement-id uint))
+  (map-get? party-lists { settlement-id: settlement-id })
+)
+
+(define-read-only (calculate-approval-progress (settlement-id uint))
+  (match (map-get? multiparty-settlements { settlement-id: settlement-id })
+    multiparty (if (> (get approval-threshold multiparty) u0)
+      (/ (* (get current-approval-weight multiparty) u100) (get approval-threshold multiparty))
+      u0
+    )
+    u0
+  )
+)
+
+(define-read-only (is-multiparty-enabled (settlement-id uint))
+  (match (map-get? multiparty-settlements { settlement-id: settlement-id })
+    multiparty (get enabled multiparty)
+    false
+  )
+)
+
+(define-read-only (get-party-claim-amount (settlement-id uint) (party principal))
+  (match (map-get? settlement-parties { settlement-id: settlement-id, party: party })
+    party-info (match (map-get? settlement-funds { settlement-id: settlement-id })
+      funds (/ (* (get deposited-amount funds) (get distribution-percentage party-info)) u100)
+      u0
+    )
+    u0
+  )
+)
+
+
+
